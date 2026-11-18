@@ -1,12 +1,8 @@
+import fonts from "./chart-font.mjs";
+
 const size = 320;
 const center = size / 2;
-const digits = [
-  "111101101101111", "010110010010111", "111001111100111",
-  "111001111001111", "101101111001001", "111100111001111",
-  "111100111101111", "111001001001001", "111101111101111",
-  "111101111001111",
-];
-const palette = [250, 252, 249, 122, 197, 112, 237, 91, 91, 28, 59, 59];
+const palette = [250, 252, 249, 122, 197, 112, 237, 91, 91, 28, 59, 59, 176, 188, 186, 102, 123, 122];
 const crcTable = Uint32Array.from({length: 256}, (_, value) => {
   for (let i = 0; i < 8; i++) value = (value >>> 1) ^ (value & 1 ? 0xedb88320 : 0);
   return value;
@@ -24,18 +20,20 @@ function chunk(type, data) {
   return bytes;
 }
 
-function paintLabel(pixels, label, x, y, scale) {
-  const left = Math.round(x - (label.length * 4 - 1) * scale / 2);
-  const top = Math.round(y - 5 * scale / 2);
-  for (const [index, digit] of [...label].entries()) {
-    const glyph = digits[digit] ?? "000000000000010";
-    for (let row = 0; row < 5 * scale; row++) {
-      for (let col = 0; col < 3 * scale; col++) {
-        if (glyph[Math.floor(row / scale) * 3 + Math.floor(col / scale)] === "1") {
-          pixels[(top + row) * (size + 1) + 1 + left + index * 4 * scale + col] = 3;
-        }
+function paintLabel(pixels, stride, label, x, y, fontSize) {
+  const font = fonts[fontSize];
+  const glyphs = Array.from(label, character => font[character]);
+  const width = glyphs.reduce((sum, [advance]) => sum + advance, 0);
+  let left = Math.round(x - width / 2);
+  const top = Math.round(y - fontSize * 0.60);
+  for (const [advance, rows] of glyphs) {
+    for (const [row, coverage] of rows.entries()) {
+      for (let col = 0; col < coverage.length; col++) {
+        const color = {1: 4, 2: 5, 3: 3}[coverage[col]];
+        if (color) pixels[(top + row) * stride + 1 + left + col] = color;
       }
     }
+    left += advance;
   }
 }
 
@@ -48,8 +46,7 @@ export function outageMinutes(hours) {
   return minutes;
 }
 
-export async function scheduleChart({hours, queue, day}) {
-  const pixels = new Uint8Array(size * (size + 1));
+function paintSchedule(pixels, stride, offset, {hours, queue, day, scope}, combined) {
   const minutes = outageMinutes(hours);
   for (let y = 0; y < size; y++) {
     for (let x = 0; x < size; x++) {
@@ -59,26 +56,35 @@ export async function scheduleChart({hours, queue, day}) {
       if (radiusSquared < 79 ** 2 || radiusSquared > 157 ** 2) continue;
       const minute = (Math.atan2(dx, -dy) * 720 / Math.PI + 1440) % 1440;
       if (Math.min(minute % 60, 60 - minute % 60) < 1.3) continue;
-      pixels[y * (size + 1) + 1 + x] = minutes[Math.floor(minute)] ? 2 : 1;
+      pixels[y * stride + 1 + offset + x] = minutes[Math.floor(minute)] ? 2 : 1;
     }
   }
   for (let hour = 0; hour < 24; hour++) {
     const angle = hour * Math.PI / 12;
-    const x = center + 139 * Math.sin(angle);
+    const x = offset + center + 139 * Math.sin(angle);
     const y = center - 139 * Math.cos(angle);
-    for (let dy = -9; dy <= 9; dy++) {
-      for (let dx = -9; dx <= 9; dx++) {
-        if (dx * dx + dy * dy <= 81) pixels[(Math.round(y) + dy) * (size + 1) + 1 + Math.round(x) + dx] = 0;
+    for (let dy = -11; dy <= 11; dy++) {
+      for (let dx = -11; dx <= 11; dx++) {
+        if (dx * dx + dy * dy <= 121) pixels[(Math.round(y) + dy) * stride + 1 + Math.round(x) + dx] = 0;
       }
     }
-    paintLabel(pixels, String(hour), x, y, 2);
+    paintLabel(pixels, stride, String(hour), x, y, 13);
   }
-  if (day) paintLabel(pixels, day.slice(5).split("-").reverse().join("."), center, center - 28, 3);
-  paintLabel(pixels, queue, center, center + (day ? 13 : 0), 8);
+  const middle = offset + center;
+  if (day) paintLabel(pixels, stride, day.slice(5).split("-").reverse().join("."), middle, center - 34, 18);
+  paintLabel(pixels, stride, queue, middle, center, 48);
+  if (combined) paintLabel(pixels, stride, scope === "uman" ? "УМАНЬ" : "ОБЛАСТЬ", middle, center + 38, 15);
+}
+
+export async function scheduleChart(schedules) {
+  const width = size * schedules.length;
+  const stride = width + 1;
+  const pixels = new Uint8Array(size * stride);
+  schedules.forEach((schedule, index) => paintSchedule(pixels, stride, index * size, schedule, schedules.length > 1));
 
   const header = new Uint8Array(13);
   const view = new DataView(header.buffer);
-  view.setUint32(0, size);
+  view.setUint32(0, width);
   view.setUint32(4, size);
   header.set([8, 3], 8);
   const compressed = await new Response(new Blob([pixels]).stream().pipeThrough(new CompressionStream("deflate"))).arrayBuffer();
