@@ -1,8 +1,9 @@
 import { scheduleChart } from "./chart.mjs";
+import { askGemini, needsGemini } from "./gemini.mjs";
 
 const channel = "pat_cherkasyoblenergo";
 const months = "січня лютого березня квітня травня червня липня серпня вересня жовтня листопада грудня".split(" ");
-const datePattern = new RegExp("(?:(?:на|з)\\s+)?(\\d{1,2})\\s+(" + months.join("|") + ")", "iu");
+const datePattern = new RegExp("(?:(?:на|з)\\s+)?(\\d{1,2})\\s+(" + months.join("|") + ")", "giu");
 
 function kyivDay(date) {
   const parts = new Intl.DateTimeFormat("en", {
@@ -14,6 +15,18 @@ function kyivDay(date) {
 
 const queues = Array.from({length: 6}, (_, index) => [`${index + 1}.1`, `${index + 1}.2`]).flat();
 
+function explicitDays(text, published) {
+  const days = new Set();
+  for (const match of text.matchAll(datePattern)) {
+    const month = months.indexOf(match[2].toLowerCase()) + 1;
+    const publishedMonth = Number(published.slice(5, 7));
+    const year = Number(published.slice(0, 4)) + (publishedMonth === 12 && month === 1 ? 1 : publishedMonth === 1 && month === 12 ? -1 : 0);
+    const date = new Date(Date.UTC(year, month - 1, Number(match[1])));
+    if (date.getUTCMonth() === month - 1) days.add(date.toISOString().slice(0, 10));
+  }
+  return days;
+}
+
 export function parsePost(post) {
   const text = post.text.replace(/\u00a0/g, " ");
   const sections = text.split(/Години відсутності електропостачання/giu);
@@ -22,16 +35,7 @@ export function parsePost(post) {
   const timestamp = new Date(post.datetime);
   if (!Number.isFinite(timestamp.getTime())) return [];
   const published = kyivDay(timestamp);
-  const match = heading.match(datePattern);
-  let day = "";
-  if (match) {
-    const month = months.indexOf(match[2].toLowerCase()) + 1;
-    const publishedMonth = Number(published.slice(5, 7));
-    const year = Number(published.slice(0, 4)) + (publishedMonth === 12 && month === 1 ? 1 : publishedMonth === 1 && month === 12 ? -1 : 0);
-    const date = new Date(Date.UTC(year, month - 1, Number(match[1])));
-    if (date.getUTCMonth() !== month - 1) return [];
-    day = date.toISOString().slice(0, 10);
-  }
+  const day = explicitDays(heading, published).values().next().value ?? "";
 
   const schedules = [];
   for (const [index, body] of bodies.entries()) {
@@ -103,11 +107,11 @@ function format(row) {
     "\nhttps://t.me/" + channel + "/" + row.post_id;
 }
 
-async function sendSchedule(env, chat, row, charts = new Map()) {
-  const caption = format(row);
-  const key = JSON.stringify([row.day, row.queue, row.hours]);
+async function sendSchedules(env, chat, rows, charts = new Map()) {
+  const caption = rows.map(format).join("\n\n");
+  const key = JSON.stringify(rows.map(({scope, day, queue, hours}) => [scope, day, queue, hours]));
   try {
-    if (!charts.has(key)) charts.set(key, await scheduleChart(row));
+    if (!charts.has(key)) charts.set(key, await scheduleChart(rows));
     const form = new FormData();
     form.set("chat_id", String(chat));
     form.set("caption", caption);
@@ -141,17 +145,72 @@ async function showToday(env, chat, queue) {
       ". Спробуй ще раз після наступної перевірки каналу.", menu);
     return;
   }
-  const charts = new Map();
-  for (const row of schedules.values()) await sendSchedule(env, chat, row, charts);
+  await sendSchedules(env, chat, [...schedules.values()]);
 }
 
-async function updateSchedules(db) {
+function scheduleKey({scope, day, queue}) {
+  return [scope, day, queue].join("/");
+}
+
+async function readGeminiRows(env, raw, published, allowRequest) {
+  const hash = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(raw.id + "\n" + raw.text));
+  const key = Array.from(new Uint8Array(hash), value => value.toString(16).padStart(2, "0")).join("");
+  const cached = await env.DB.prepare("SELECT rows_json FROM gemini_post_cache WHERE source_hash = ?").bind(key).first();
+  if (cached) return {rows: JSON.parse(cached.rows_json), requested: false};
+  const allowedDays = explicitDays(raw.text, published);
+  if (/сьогодні/iu.test(raw.text)) allowedDays.add(published);
+  if (/завтра/iu.test(raw.text)) {
+    const tomorrow = new Date(Date.parse(published) + 86400000);
+    allowedDays.add(tomorrow.toISOString().slice(0, 10));
+  }
+  if (!allowRequest || !allowedDays.size) return {rows: [], requested: false};
+  const rows = await askGemini(env, raw.text, published, allowedDays);
+  await env.DB.prepare("INSERT OR IGNORE INTO gemini_post_cache (source_hash, rows_json) VALUES (?, ?)")
+    .bind(key, JSON.stringify(rows)).run();
+  return {rows, requested: true};
+}
+
+async function updateSchedules(env) {
+  const db = env.DB;
   const today = kyivDay(new Date());
   const latest = new Map();
-  for (const raw of await readFeed()) {
-    for (const post of parsePost(raw)) {
+  let requestsLeft = 3;
+  for (const raw of (await readFeed()).sort((a, b) => a.id - b.id)) {
+    const parsed = parsePost(raw);
+    const timestamp = new Date(raw.datetime);
+    if (env.GEMINI_API_KEY && Number.isSafeInteger(raw.id) && raw.datetime &&
+        Number.isFinite(timestamp.getTime()) && needsGemini(raw.text, parsed)) {
+      try {
+        const published = kyivDay(timestamp);
+        const {rows, requested} = await readGeminiRows(env, raw, published, requestsLeft > 0);
+        if (requested) requestsLeft--;
+        for (const row of rows) {
+          if (row.day < today) continue;
+          const key = scheduleKey(row);
+          const recognized = parsed.findIndex(item => scheduleKey(item) === key);
+          if (recognized >= 0 && row.kind === "full") continue;
+          let intervals = row.intervals;
+          if (row.kind === "replace") {
+            const base = await db.prepare("SELECT hours, post_id FROM schedules WHERE scope = ? AND day = ? AND queue = ?")
+              .bind(row.scope, row.day, row.queue).first();
+            const pending = latest.get(key);
+            const hours = (pending && pending.id >= (base?.post_id ?? 0) ? pending.hours : base?.hours)?.split(", ");
+            const [old, replacement] = intervals;
+            if (!hours?.includes(old) || (base && base.post_id > raw.id)) continue;
+            intervals = hours.map(hour => hour === old ? replacement : hour);
+          }
+          const schedule = {...row, id: raw.id, hours: [...new Set(intervals)].sort().join(", ")};
+          if (recognized >= 0) parsed[recognized] = schedule;
+          else parsed.push(schedule);
+        }
+      } catch {
+        requestsLeft = 0;
+        console.error("Gemini schedule fallback failed");
+      }
+    }
+    for (const post of parsed) {
       if (post.day && post.day < today) continue;
-      const key = [post.scope, post.day, post.queue].join("/");
+      const key = scheduleKey(post);
       if (!latest.has(key) || latest.get(key).id < post.id) latest.set(key, post);
     }
   }
@@ -170,20 +229,34 @@ async function deliver(env) {
   const today = kyivDay(new Date());
   await env.DB.prepare("DELETE FROM deliveries WHERE day <> '' AND day < ?").bind(today).run();
   const {results} = await env.DB.prepare(`
-    SELECT d.*, s.hours, s.post_id FROM deliveries d
-    JOIN schedules s USING (scope, day, queue, revision)
-    ORDER BY d.revision, d.chat_id LIMIT 10
+    WITH pending AS (
+      SELECT d.*, s.hours, s.post_id FROM deliveries d
+      JOIN schedules s USING (scope, day, queue, revision)
+    ), groups AS (
+      SELECT chat_id, queue, day, post_id FROM pending
+      GROUP BY chat_id, queue, day, post_id ORDER BY MIN(revision), chat_id, post_id LIMIT 10
+    )
+    SELECT pending.* FROM pending JOIN groups USING (chat_id, queue, day, post_id)
+    ORDER BY chat_id, post_id, day, scope
   `).all();
-  const charts = new Map();
+  const groups = new Map();
   for (const row of results) {
+    const key = JSON.stringify([row.chat_id, row.queue, row.day, row.post_id]);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(row);
+  }
+  const charts = new Map();
+  for (const rows of groups.values()) {
+    const [{chat_id: chat}] = rows;
     try {
-      const result = await sendSchedule(env, row.chat_id, row, charts);
+      const result = await sendSchedules(env, chat, rows, charts);
       if (result.status === 429) break;
       if (result.status === 403) {
-        await env.DB.prepare("DELETE FROM subscribers WHERE chat_id = ?").bind(row.chat_id).run();
+        await env.DB.prepare("DELETE FROM subscribers WHERE chat_id = ?").bind(chat).run();
       } else if (result.ok) {
-        await env.DB.prepare("DELETE FROM deliveries WHERE scope = ? AND day = ? AND queue = ? AND revision = ? AND chat_id = ?")
-          .bind(row.scope, row.day, row.queue, row.revision, row.chat_id).run();
+        await env.DB.batch(rows.map(row => env.DB.prepare(
+          "DELETE FROM deliveries WHERE scope = ? AND day = ? AND queue = ? AND revision = ? AND chat_id = ?"
+        ).bind(row.scope, row.day, row.queue, row.revision, chat)));
       } else {
         console.error("Telegram delivery failed", result.status);
       }
@@ -223,7 +296,7 @@ const queuePicker = {
 export default {
   async scheduled(_event, env) {
     try {
-      await updateSchedules(env.DB);
+      await updateSchedules(env);
     } finally {
       await deliver(env);
     }
