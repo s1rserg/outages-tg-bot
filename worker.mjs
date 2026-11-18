@@ -109,14 +109,24 @@ function format(row) {
 
 async function sendSchedules(env, chat, rows, charts = new Map()) {
   const caption = rows.map(format).join("\n\n");
-  const key = JSON.stringify(rows.map(({scope, day, queue, hours}) => [scope, day, queue, hours]));
   try {
-    if (!charts.has(key)) charts.set(key, await scheduleChart(rows));
     const form = new FormData();
     form.set("chat_id", String(chat));
-    form.set("caption", caption);
-    form.set("photo", charts.get(key), "outages.png");
-    const response = await fetch("https://api.telegram.org/bot" + env.BOT_TOKEN + "/sendPhoto", {
+    const album = rows.length > 1;
+    for (const [index, row] of rows.entries()) {
+      const key = JSON.stringify([row.scope, row.day, row.queue, row.hours]);
+      if (!charts.has(key)) charts.set(key, await scheduleChart(row));
+      form.set(album ? "chart" + index : "photo", charts.get(key), row.scope + ".png");
+    }
+    if (album) {
+      form.set("media", JSON.stringify(rows.map((row, index) => ({
+        type: "photo", media: "attach://chart" + index, caption: index === 0 ? caption : undefined,
+      }))));
+    } else {
+      form.set("caption", caption);
+    }
+    const method = album ? "sendMediaGroup" : "sendPhoto";
+    const response = await fetch("https://api.telegram.org/bot" + env.BOT_TOKEN + "/" + method, {
       method: "POST", body: form, signal: AbortSignal.timeout(10000),
     });
     const result = await response.json();
