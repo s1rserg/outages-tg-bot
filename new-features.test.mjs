@@ -16,7 +16,7 @@ test("Gemini fallback checks source intervals and catches cancellations without 
   assert.deepEqual(verifyGeminiRows({rows: [{...row, intervals: ["06:00–09:30"]}]}, text, new Set([day])), []);
 });
 
-test("today sends both diagrams in one Telegram photo", async t => {
+test("today sends both diagrams in one Telegram album", async t => {
   const schedules = [
     {day, scope: "oblast", queue: "2.2", hours: "06:00–08:00", post_id: 1},
     {day, scope: "uman", queue: "2.2", hours: "06:00–09:00", post_id: 1},
@@ -40,11 +40,16 @@ test("today sends both diagrams in one Telegram photo", async t => {
     body: JSON.stringify({message: {text: "/today", chat: {id: 1, type: "private"}}}),
   }), env);
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /sendPhoto$/u);
-  assert.match(calls[0].form.get("caption"), /Черкаська область[\s\S]+Уманські енергомережі/u);
-  const png = new DataView(await calls[0].form.get("photo").arrayBuffer());
-  assert.equal(png.getUint32(16), 640);
-  assert.equal(png.getUint32(20), 320);
-  const single = new DataView(await (await scheduleChart([schedules[0]])).arrayBuffer());
-  assert.equal(single.getUint32(16), 320);
+  assert.match(calls[0].url, /sendMediaGroup$/u);
+  const media = JSON.parse(calls[0].form.get("media"));
+  assert.deepEqual(media.map(item => item.media), ["attach://chart0", "attach://chart1"]);
+  assert.match(media[0].caption, /Черкаська область[\s\S]+Уманські енергомережі/u);
+  assert.equal(media[1].caption, undefined);
+  for (const name of ["chart0", "chart1"]) {
+    const png = new DataView(await calls[0].form.get(name).arrayBuffer());
+    assert.equal(png.getUint32(16), 480);
+    assert.equal(png.getUint32(20), 480);
+  }
+  const single = new DataView(await (await scheduleChart(schedules[0])).arrayBuffer());
+  assert.equal(single.getUint32(16), 480);
 });
