@@ -14,36 +14,47 @@ function kyivDay(date) {
 
 const queues = Array.from({length: 6}, (_, index) => [`${index + 1}.1`, `${index + 1}.2`]).flat();
 
-export function parsePost(post, queue = "2.2") {
-  if (!queues.includes(queue)) return null;
+export function parsePost(post) {
   const text = post.text.replace(/\u00a0/g, " ");
-  const heading = text.split(/Години відсутності електропостачання/iu);
-  if (heading.length < 2) return null;
-  const uman = /Уманськ/iu.test(heading[0]) && /тимчасов|індивідуальн/iu.test(heading[0]);
-  if (!uman && !/ГПВ|графік\p{L}* погодинних відключень/iu.test(heading[0])) return null;
-  const rows = heading[1].matchAll(/^[ \t]*([1-6]\.[12])(?=[ \t:–—-])[ \t]*[:–—-]?[ \t]*([^\n]+)/gmu);
-  const row = [...rows].find(([, label]) => label === queue);
-  if (!row || !post.datetime || !Number.isSafeInteger(post.id)) return null;
-  const intervals = [...row[2].matchAll(/((?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—−]\s*((?:[01]\d|2[0-3]):[0-5]\d|24:00)/gu)]
-    .filter(([, start, end]) => start < end)
-    .map(([, start, end]) => start + "–" + end);
-  const hours = [...new Set(intervals)].sort().join(", ");
-  if (!hours && !/без відключень|не (?:застосовуються|вимикається|відключається)|відключень не буде/iu.test(row[2])) return null;
-
-  const published = kyivDay(new Date(post.datetime));
-  const match = heading[0].match(datePattern);
+  const sections = text.split(/Години відсутності електропостачання/giu);
+  const [heading, ...bodies] = sections;
+  if (!bodies.length || !Number.isSafeInteger(post.id) || !post.datetime) return [];
+  const timestamp = new Date(post.datetime);
+  if (!Number.isFinite(timestamp.getTime())) return [];
+  const published = kyivDay(timestamp);
+  const match = heading.match(datePattern);
   let day = "";
   if (match) {
     const month = months.indexOf(match[2].toLowerCase()) + 1;
     const publishedMonth = Number(published.slice(5, 7));
     const year = Number(published.slice(0, 4)) + (publishedMonth === 12 && month === 1 ? 1 : publishedMonth === 1 && month === 12 ? -1 : 0);
     const date = new Date(Date.UTC(year, month - 1, Number(match[1])));
-    if (date.getUTCMonth() !== month - 1) return null;
+    if (date.getUTCMonth() !== month - 1) return [];
     day = date.toISOString().slice(0, 10);
-  } else if (!uman) {
-    return null;
   }
-  return { id: post.id, scope: uman ? "uman" : "oblast", day, hours };
+
+  const schedules = [];
+  for (const [index, body] of bodies.entries()) {
+    const hasRegionalLabel = /^[ \t*]*по області(?=[ \t(:*]|$)/iu.test(body);
+    const previous = sections[index];
+    const uman = !hasRegionalLabel && (
+      /Уманськ/iu.test(index === 0 ? heading : previous) &&
+      /тимчасов|індивідуальн/iu.test(index === 0 ? heading : previous)
+    );
+    const regional = hasRegionalLabel || (index === 0 && day && /ГПВ|графік\p{L}* погодинних відключень/iu.test(heading));
+    if (!uman && !regional) continue;
+
+    const rows = body.matchAll(/^[ \t*]*([1-6]\.[12])(?=[ \t*:–—-])[ \t*]*[:–—-]?[ \t]*([^\n]+)/gmu);
+    for (const [, queue, row] of rows) {
+      const intervals = [...row.matchAll(/((?:[01]\d|2[0-3]):[0-5]\d)\s*[-–—−]\s*((?:[01]\d|2[0-3]):[0-5]\d|24:00)/gu)]
+        .filter(([, start, end]) => start < end)
+        .map(([, start, end]) => start + "–" + end);
+      const hours = [...new Set(intervals)].sort().join(", ");
+      if (!hours && !/без відключень|не (?:застосовуються|вимикається|відключається)|відключень не буде/iu.test(row)) continue;
+      schedules.push({id: post.id, scope: uman ? "uman" : "oblast", day, queue, hours});
+    }
+  }
+  return schedules;
 }
 
 async function readFeed() {
@@ -85,7 +96,7 @@ async function send(env, chat, message, keyboard) {
 }
 
 function format(row) {
-  const area = row.scope === "uman" ? "Уманський район · тимчасовий графік" : "Черкаська область";
+  const area = row.scope === "uman" ? "Уманські енергомережі та окремі філії · тимчасовий графік" : "Черкаська область";
   const date = row.day ? "\nГрафік на " + row.day.split("-").reverse().join(".") : "\nУ дописі не вказано дату дії графіка.";
   const hours = row.hours ? "Без світла " + row.hours : "Відключень за графіком немає";
   return "⚡ " + area + " · підчерга " + row.queue + date + "\n" + hours +
@@ -118,7 +129,7 @@ async function showToday(env, chat, queue) {
   const today = kyivDay(new Date());
   const {results} = await env.DB.prepare(`
     SELECT scope, day, queue, hours, post_id FROM schedules
-    WHERE queue = ? AND (day = ? OR (scope = 'uman' AND day = ''))
+    WHERE queue = ? AND (day = ? OR day = '')
     ORDER BY scope, day DESC
   `).bind(queue, today).all();
   const schedules = new Map();
@@ -138,11 +149,10 @@ async function updateSchedules(db) {
   const today = kyivDay(new Date());
   const latest = new Map();
   for (const raw of await readFeed()) {
-    for (const queue of queues) {
-      const post = parsePost(raw, queue);
-      if (!post || (post.day && post.day < today)) continue;
-      const key = [post.scope, post.day, queue].join("/");
-      if (!latest.has(key) || latest.get(key).id < post.id) latest.set(key, {...post, queue});
+    for (const post of parsePost(raw)) {
+      if (post.day && post.day < today) continue;
+      const key = [post.scope, post.day, post.queue].join("/");
+      if (!latest.has(key) || latest.get(key).id < post.id) latest.set(key, post);
     }
   }
   if (!latest.size) return;
