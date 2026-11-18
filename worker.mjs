@@ -1,3 +1,5 @@
+import { scheduleChart } from "./chart.mjs";
+
 const channel = "pat_cherkasyoblenergo";
 const months = "січня лютого березня квітня травня червня липня серпня вересня жовтня листопада грудня".split(" ");
 const datePattern = new RegExp("(?:(?:на|з)\\s+)?(\\d{1,2})\\s+(" + months.join("|") + ")", "iu");
@@ -84,10 +86,52 @@ async function send(env, chat, message, keyboard) {
 
 function format(row) {
   const area = row.scope === "uman" ? "Уманський район · тимчасовий графік" : "Черкаська область";
-  const date = row.day ? "\nГрафік на " + row.day.split("-").reverse().join(".") : "";
+  const date = row.day ? "\nГрафік на " + row.day.split("-").reverse().join(".") : "\nУ дописі не вказано дату дії графіка.";
   const hours = row.hours ? "Без світла " + row.hours : "Відключень за графіком немає";
   return "⚡ " + area + " · підчерга " + row.queue + date + "\n" + hours +
     "\nhttps://t.me/" + channel + "/" + row.post_id;
+}
+
+async function sendSchedule(env, chat, row, charts = new Map()) {
+  const caption = format(row);
+  const key = JSON.stringify([row.day, row.queue, row.hours]);
+  try {
+    if (!charts.has(key)) charts.set(key, await scheduleChart(row));
+    const form = new FormData();
+    form.set("chat_id", String(chat));
+    form.set("caption", caption);
+    form.set("photo", charts.get(key), "outages.png");
+    const response = await fetch("https://api.telegram.org/bot" + env.BOT_TOKEN + "/sendPhoto", {
+      method: "POST", body: form, signal: AbortSignal.timeout(10000),
+    });
+    const result = await response.json();
+    if (result.error_code !== 400) {
+      return {ok: response.ok && result.ok, status: result.error_code ?? response.status};
+    }
+  } catch {
+    console.error("Schedule photo could not be generated or sent");
+  }
+  return send(env, chat, caption);
+}
+
+async function showToday(env, chat, queue) {
+  const today = kyivDay(new Date());
+  const {results} = await env.DB.prepare(`
+    SELECT scope, day, queue, hours, post_id FROM schedules
+    WHERE queue = ? AND (day = ? OR (scope = 'uman' AND day = ''))
+    ORDER BY scope, day DESC
+  `).bind(queue, today).all();
+  const schedules = new Map();
+  for (const row of results) {
+    if (!schedules.has(row.scope)) schedules.set(row.scope, row);
+  }
+  if (schedules.size === 0) {
+    await send(env, chat, "Поки немає графіка на сьогодні для підчерги " + queue +
+      ". Спробуй ще раз після наступної перевірки каналу.", menu);
+    return;
+  }
+  const charts = new Map();
+  for (const row of schedules.values()) await sendSchedule(env, chat, row, charts);
 }
 
 async function updateSchedules(db) {
@@ -118,11 +162,12 @@ async function deliver(env) {
   const {results} = await env.DB.prepare(`
     SELECT d.*, s.hours, s.post_id FROM deliveries d
     JOIN schedules s USING (scope, day, queue, revision)
-    ORDER BY d.revision, d.chat_id LIMIT 20
+    ORDER BY d.revision, d.chat_id LIMIT 10
   `).all();
+  const charts = new Map();
   for (const row of results) {
     try {
-      const result = await send(env, row.chat_id, format(row));
+      const result = await sendSchedule(env, row.chat_id, row, charts);
       if (result.status === 429) break;
       if (result.status === 403) {
         await env.DB.prepare("DELETE FROM subscribers WHERE chat_id = ?").bind(row.chat_id).run();
@@ -139,6 +184,7 @@ async function deliver(env) {
 }
 
 const buttons = {
+  "📅 Графік на сьогодні": "/today",
   "🔔 Увімкнути сповіщення": "/start",
   "⚙️ Обрати підчергу": "/queue",
   "🔕 Вимкнути сповіщення": "/stop",
@@ -147,6 +193,7 @@ const buttons = {
 };
 const menu = {
   keyboard: [
+    ["📅 Графік на сьогодні"],
     ["⚙️ Обрати підчергу", "❔ Довідка"],
     ["🔔 Увімкнути сповіщення", "🔕 Вимкнути сповіщення"],
   ],
@@ -193,6 +240,11 @@ export default {
       ).bind(chat).first();
       await send(env, chat, "Підписка активна. Твоя підчерга — " + subscriber.queue +
         ". Щоб змінити її, натисни «Обрати підчергу».", menu);
+      await showToday(env, chat, subscriber.queue);
+    } else if (command === "/today") {
+      const subscriber = await env.DB.prepare("SELECT queue FROM subscribers WHERE chat_id = ?").bind(chat).first();
+      if (subscriber) await showToday(env, chat, subscriber.queue);
+      else await send(env, chat, "Щоб побачити свій графік, спочатку обери підчергу.", queuePicker);
     } else if (command === "/queue") {
       if (args.length === 0) {
         const subscriber = await env.DB.prepare("SELECT queue FROM subscribers WHERE chat_id = ?").bind(chat).first();
@@ -204,6 +256,7 @@ export default {
           "INSERT INTO subscribers (chat_id, queue) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET queue = excluded.queue"
         ).bind(chat, args[0]).run();
         await send(env, chat, "Підчерга " + args[0] + " збережена. Надсилатиму оновлення обох графіків для неї.", menu);
+        await showToday(env, chat, args[0]);
       } else {
         await send(env, chat, "Введи підчергу від 1.1 до 6.2. Наприклад, /queue 3.1.", queuePicker);
       }
@@ -214,6 +267,7 @@ export default {
       await send(env, chat, [
         "Бот повідомляє про зміни в обласному й тимчасовому уманському графіках.",
         "🔔 Увімкнути сповіщення (/start) — підписка з підчергою 2.2 за замовчуванням.",
+        "📅 Графік на сьогодні (/today) — показати збережені години для твоєї підчерги.",
         "⚙️ Обрати підчергу (/queue) — показати поточну підчергу та вибрати іншу.",
         "🔕 Вимкнути сповіщення (/stop) — відписатися від розсилки.",
       ].join("\n\n"), menu);
