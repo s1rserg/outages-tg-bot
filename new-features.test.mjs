@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import {test} from "node:test";
 import {scheduleChart} from "./chart.mjs";
 import {needsGemini, verifyGeminiRows} from "./gemini.mjs";
-import worker from "./worker.mjs";
+import worker, {format, isUmanNotice} from "./worker.mjs";
 
 const day = "2026-11-18";
 
@@ -16,9 +16,8 @@ test("Gemini fallback checks source intervals and catches cancellations without 
   assert.deepEqual(verifyGeminiRows({rows: [{...row, intervals: ["06:00–09:30"]}]}, text, new Set([day])), []);
 });
 
-test("today sends both diagrams in one Telegram album", async t => {
+test("today requests only the Uman schedule and sends one diagram", async t => {
   const schedules = [
-    {day, scope: "oblast", queue: "2.2", hours: "06:00–08:00", post_id: 1},
     {day, scope: "uman", queue: "2.2", hours: "06:00–09:00", post_id: 1},
   ];
   const calls = [];
@@ -29,10 +28,12 @@ test("today sends both diagrams in one Telegram album", async t => {
   const env = {
     BOT_TOKEN: "test",
     WEBHOOK_SECRET: "test",
-    DB: {prepare: () => ({bind: () => ({
+    DB: {prepare: sql => {
+      if (sql.includes("FROM schedules")) assert.match(sql, /scope = 'uman'/u);
+      return {bind: () => ({
       first: async () => ({queue: "2.2"}),
       all: async () => ({results: schedules}),
-    })})},
+    })}; }},
   };
   await worker.fetch(new Request("https://worker.example/telegram", {
     method: "POST",
@@ -40,16 +41,22 @@ test("today sends both diagrams in one Telegram album", async t => {
     body: JSON.stringify({message: {text: "/today", chat: {id: 1, type: "private"}}}),
   }), env);
   assert.equal(calls.length, 1);
-  assert.match(calls[0].url, /sendMediaGroup$/u);
-  const media = JSON.parse(calls[0].form.get("media"));
-  assert.deepEqual(media.map(item => item.media), ["attach://chart0", "attach://chart1"]);
-  assert.match(media[0].caption, /Черкаська область[\s\S]+Уманські енергомережі/u);
-  assert.equal(media[1].caption, undefined);
-  for (const name of ["chart0", "chart1"]) {
-    const png = new DataView(await calls[0].form.get(name).arrayBuffer());
-    assert.equal(png.getUint32(16), 480);
-    assert.equal(png.getUint32(20), 480);
-  }
+  assert.match(calls[0].url, /sendPhoto$/u);
+  assert.match(calls[0].form.get("caption"), /Умань[\s\S]+Без світла — 3 год[\s\S]+Зі світлом — 21 год/u);
+  const png = new DataView(await calls[0].form.get("photo").arrayBuffer());
+  assert.equal(png.getUint32(16), 480);
   const single = new DataView(await (await scheduleChart(schedules[0])).arrayBuffer());
   assert.equal(single.getUint32(16), 480);
+});
+
+test("recognizes the Uman deviation notice without schedule intervals", () => {
+  assert.equal(isUmanNotice("До уваги споживачів Уманського району. Сьогодні протягом дня в Уманському районі можливі незначні відхилення від графіків погодинних відключень електроенергії."), true);
+  assert.equal(isUmanNotice("У Черкасах можливі відхилення від графіків відключень"), false);
+  assert.equal(isUmanNotice("В Уманському районі відкрито новий офіс"), false);
+});
+
+test("daily totals count overlapping intervals only once", () => {
+  const text = format({queue: "2.2", day, post_id: 1, hours: "06:00–08:30, 08:00–09:00, 23:30–24:00"});
+  assert.match(text, /Без світла — 3 год 30 хв/u);
+  assert.match(text, /Зі світлом — 20 год 30 хв/u);
 });
