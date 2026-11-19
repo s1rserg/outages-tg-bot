@@ -1,4 +1,4 @@
-import { scheduleChart } from "./chart.mjs";
+import { scheduleChart, outageMinutes } from "./chart.mjs";
 import { askGemini, needsGemini } from "./gemini.mjs";
 
 const channel = "pat_cherkasyoblenergo";
@@ -99,12 +99,79 @@ async function send(env, chat, message, keyboard) {
   return { ok: response.ok && result.ok, status: result.error_code ?? response.status };
 }
 
-function format(row) {
-  const area = row.scope === "uman" ? "Уманські енергомережі та окремі філії · тимчасовий графік" : "Черкаська область";
-  const date = row.day ? "\nГрафік на " + row.day.split("-").reverse().join(".") : "\nУ дописі не вказано дату дії графіка.";
-  const hours = row.hours ? "Без світла " + row.hours : "Відключень за графіком немає";
-  return "⚡ " + area + " · підчерга " + row.queue + date + "\n" + hours +
-    "\nhttps://t.me/" + channel + "/" + row.post_id;
+function duration(minutes) {
+  const hours = Math.floor(minutes / 60);
+  return hours + " год" + (minutes % 60 ? " " + minutes % 60 + " хв" : "");
+}
+
+export function format(row) {
+  const withoutPower = outageMinutes(row.hours).reduce((sum, value) => sum + value, 0);
+  const date = row.day ? row.day.split("-").reverse().join(".") : "дату не вказано в дописі";
+  return [
+    "⚡ Умань · підчерга " + row.queue,
+    "📅 " + date,
+    "",
+    "🔴 Без світла за графіком",
+    row.hours ? row.hours.split(", ").join("\n") : "Відключень немає",
+    "",
+    "За повним збереженим графіком на добу",
+    "🔴 Без світла — " + duration(withoutPower),
+    "🟢 Зі світлом — " + duration(1440 - withoutPower),
+    "",
+    "Джерело: https://t.me/" + channel + "/" + row.post_id,
+  ].join("\n");
+}
+
+export function isUmanNotice(text) {
+  return /Уманськ/iu.test(text) &&
+    /відключенн|електропостачан|знеструм|електроенерг/iu.test(text) &&
+    /відхиленн|можливі перебої|аварійн|поза графіком|не дотрим|зміна черг|змін[а-яіїєґ]* підчерг/iu.test(text);
+}
+
+async function saveNotices(db, posts) {
+  const today = kyivDay(new Date());
+  const statements = [];
+  for (const post of posts) {
+    if (!post.datetime || !Number.isSafeInteger(post.id) || !isUmanNotice(post.text)) continue;
+    const timestamp = new Date(post.datetime);
+    if (!Number.isFinite(timestamp.getTime())) continue;
+    const published = kyivDay(timestamp);
+    const explicit = explicitDays(post.text, published);
+    const day = explicit.size ? [...explicit].sort().at(-1) : published;
+    if (day < today) continue;
+    statements.push(db.prepare(`
+      INSERT INTO notices (post_id, text, day) VALUES (?, ?, ?)
+      ON CONFLICT(post_id) DO UPDATE SET text = excluded.text, day = excluded.day,
+        revision = notices.revision + 1 WHERE notices.text <> excluded.text
+    `).bind(post.id, post.text, day));
+  }
+  if (statements.length) await db.batch(statements);
+}
+
+async function deliverNotices(env) {
+  const today = kyivDay(new Date());
+  await env.DB.prepare("DELETE FROM notice_deliveries WHERE post_id IN (SELECT post_id FROM notices WHERE day < ?)")
+    .bind(today).run();
+  const {results} = await env.DB.prepare(`
+    SELECT d.*, n.text FROM notice_deliveries d JOIN notices n USING (post_id, revision)
+    ORDER BY post_id, chat_id LIMIT 10
+  `).all();
+  for (const row of results) {
+    const text = "⚠️ Повідомлення для Уманського району\n\n" + row.text.slice(0, 3700) +
+      "\n\nДжерело: https://t.me/" + channel + "/" + row.post_id;
+    try {
+      const result = await send(env, row.chat_id, text);
+      if (result.status === 429) break;
+      if (result.status === 403) {
+        await env.DB.prepare("DELETE FROM subscribers WHERE chat_id = ?").bind(row.chat_id).run();
+      } else if (result.ok) {
+        await env.DB.prepare("DELETE FROM notice_deliveries WHERE post_id = ? AND revision = ? AND chat_id = ?")
+          .bind(row.post_id, row.revision, row.chat_id).run();
+      }
+    } catch {
+      console.error("Uman notice delivery failed");
+    }
+  }
 }
 
 async function sendSchedules(env, chat, rows, charts = new Map()) {
@@ -143,7 +210,7 @@ async function showToday(env, chat, queue) {
   const today = kyivDay(new Date());
   const {results} = await env.DB.prepare(`
     SELECT scope, day, queue, hours, post_id FROM schedules
-    WHERE queue = ? AND (day = ? OR day = '')
+    WHERE scope = 'uman' AND queue = ? AND (day = ? OR day = '')
     ORDER BY scope, day DESC
   `).bind(queue, today).all();
   const schedules = new Map();
@@ -185,7 +252,9 @@ async function updateSchedules(env) {
   const today = kyivDay(new Date());
   const latest = new Map();
   let requestsLeft = 3;
-  for (const raw of (await readFeed()).sort((a, b) => a.id - b.id)) {
+  const posts = (await readFeed()).sort((a, b) => a.id - b.id);
+  await saveNotices(db, posts);
+  for (const raw of posts) {
     const parsed = parsePost(raw);
     const timestamp = new Date(raw.datetime);
     if (env.GEMINI_API_KEY && Number.isSafeInteger(raw.id) && raw.datetime &&
@@ -219,7 +288,7 @@ async function updateSchedules(env) {
       }
     }
     for (const post of parsed) {
-      if (post.day && post.day < today) continue;
+      if (post.scope !== "uman" || (post.day && post.day < today)) continue;
       const key = scheduleKey(post);
       if (!latest.has(key) || latest.get(key).id < post.id) latest.set(key, post);
     }
@@ -242,6 +311,7 @@ async function deliver(env) {
     WITH pending AS (
       SELECT d.*, s.hours, s.post_id FROM deliveries d
       JOIN schedules s USING (scope, day, queue, revision)
+      WHERE s.scope = 'uman'
     ), groups AS (
       SELECT chat_id, queue, day, post_id FROM pending
       GROUP BY chat_id, queue, day, post_id ORDER BY MIN(revision), chat_id, post_id LIMIT 10
@@ -308,7 +378,11 @@ export default {
     try {
       await updateSchedules(env);
     } finally {
-      await deliver(env);
+      try {
+        await deliverNotices(env);
+      } finally {
+        await deliver(env);
+      }
     }
   },
   async fetch(request, env) {
@@ -348,7 +422,7 @@ export default {
         await env.DB.prepare(
           "INSERT INTO subscribers (chat_id, queue) VALUES (?, ?) ON CONFLICT(chat_id) DO UPDATE SET queue = excluded.queue"
         ).bind(chat, args[0]).run();
-        await send(env, chat, "Підчерга " + args[0] + " збережена. Надсилатиму оновлення обох графіків для неї.", menu);
+        await send(env, chat, "Підчерга " + args[0] + " збережена. Надсилатиму оновлення уманського графіка для неї.", menu);
         await showToday(env, chat, args[0]);
       } else {
         await send(env, chat, "Введи підчергу від 1.1 до 6.2. Наприклад, /queue 3.1.", queuePicker);
@@ -358,7 +432,7 @@ export default {
       await send(env, chat, "Підписку вимкнено.", menu);
     } else if (command === "/help") {
       await send(env, chat, [
-        "Бот повідомляє про зміни в обласному й тимчасовому уманському графіках.",
+        "Бот повідомляє про уманський графік і важливі оголошення для Уманського району.",
         "🔔 Увімкнути сповіщення (/start) — підписка з підчергою 2.2 за замовчуванням.",
         "📅 Графік на сьогодні (/today) — показати збережені години для твоєї підчерги.",
         "⚙️ Обрати підчергу (/queue) — показати поточну підчергу та вибрати іншу.",
