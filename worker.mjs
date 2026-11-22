@@ -1,3 +1,4 @@
+import {rebuildDay, localClock, upcomingOutages} from "./schedule-history.mjs";
 import { scheduleChart, outageMinutes } from "./chart.mjs";
 import { askGemini, needsGemini } from "./gemini.mjs";
 
@@ -114,9 +115,9 @@ export function format(row) {
     "🔴 Без світла за графіком",
     row.hours ? row.hours.split(", ").join("\n") : "Відключень немає",
     "",
-    "За повним збереженим графіком на добу",
+    row.day_complete === 0 ? "⚠️ Повного графіка доби немає. Відомі інтервали:" : "За відновленим графіком на добу",
     "🔴 Без світла — " + duration(withoutPower),
-    "🟢 Зі світлом — " + duration(1440 - withoutPower),
+    row.day_complete === 0 ? "Підсумок часу зі світлом за добу невідомий" : "🟢 Зі світлом — " + duration(1440 - withoutPower),
     "",
     "Джерело: https://t.me/" + channel + "/" + row.post_id,
   ].join("\n");
@@ -209,7 +210,7 @@ async function sendSchedules(env, chat, rows, charts = new Map()) {
 async function showToday(env, chat, queue) {
   const today = kyivDay(new Date());
   const {results} = await env.DB.prepare(`
-    SELECT scope, day, queue, hours, post_id FROM schedules
+    SELECT scope, day, queue, hours, post_id, day_complete FROM schedules
     WHERE scope = 'uman' AND queue = ? AND (day = ? OR day = '')
     ORDER BY scope, day DESC
   `).bind(queue, today).all();
@@ -290,18 +291,30 @@ async function updateSchedules(env) {
     for (const post of parsed) {
       if (post.scope !== "uman" || (post.day && post.day < today)) continue;
       const key = scheduleKey(post);
-      if (!latest.has(key) || latest.get(key).id < post.id) latest.set(key, post);
+      await db.prepare(`
+        INSERT INTO schedule_sources(post_id, scope, day, queue, hours, published, is_update)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(post_id, scope, day, queue) DO UPDATE SET hours=excluded.hours,
+          published=excluded.published, is_update=excluded.is_update
+      `).bind(post.id, post.scope, post.day, post.queue, post.hours, raw.datetime,
+        Number(/оновлен|коригув/iu.test(raw.text.slice(0, raw.text.indexOf("Години відсутності"))))).run();
+      latest.set(key, post);
     }
   }
   if (!latest.size) return;
+  for (const post of latest.values()) {
+    const {results} = await db.prepare("SELECT * FROM schedule_sources WHERE scope=? AND day=? AND queue=? ORDER BY post_id")
+      .bind(post.scope, post.day, post.queue).all();
+    Object.assign(post, rebuildDay(results));
+  }
   await db.batch([...latest.values()].map(post => db.prepare(`
-    INSERT INTO schedules (scope, day, queue, post_id, hours) VALUES (?, ?, ?, ?, ?)
+    INSERT INTO schedules (scope, day, queue, post_id, hours, day_complete) VALUES (?, ?, ?, ?, ?, ?)
     ON CONFLICT(scope, day, queue) DO UPDATE SET post_id = excluded.post_id,
-      hours = excluded.hours,
-      revision = schedules.revision + (schedules.hours <> excluded.hours)
+      hours = excluded.hours, day_complete = excluded.day_complete,
+      revision = schedules.revision + (schedules.hours <> excluded.hours OR schedules.day_complete <> excluded.day_complete)
     WHERE excluded.post_id >= schedules.post_id
-      AND (excluded.post_id <> schedules.post_id OR excluded.hours <> schedules.hours)
-  `).bind(post.scope, post.day, post.queue, post.id, post.hours)));
+      AND (excluded.post_id <> schedules.post_id OR excluded.hours <> schedules.hours OR excluded.day_complete <> schedules.day_complete)
+  `).bind(post.scope, post.day, post.queue, post.id, post.hours, post.day_complete)));
 }
 
 async function deliver(env) {
@@ -309,7 +322,7 @@ async function deliver(env) {
   await env.DB.prepare("DELETE FROM deliveries WHERE day <> '' AND day < ?").bind(today).run();
   const {results} = await env.DB.prepare(`
     WITH pending AS (
-      SELECT d.*, s.hours, s.post_id FROM deliveries d
+      SELECT d.*, s.hours, s.post_id, s.day_complete FROM deliveries d
       JOIN schedules s USING (scope, day, queue, revision)
       WHERE s.scope = 'uman'
     ), groups AS (
@@ -346,7 +359,43 @@ async function deliver(env) {
   }
 }
 
+async function deliverReminders(env) {
+  const now = new Date();
+  const day = kyivDay(now);
+  const clock = localClock(now);
+  const minute = Number(clock.slice(0, 2)) * 60 + Number(clock.slice(3));
+  const tomorrow = kyivDay(new Date(now.getTime() + 86400000));
+  const {results} = await env.DB.prepare(`
+    SELECT u.chat_id, u.queue, s.hours, s.day FROM subscribers u JOIN schedules s ON s.queue=u.queue
+    WHERE u.reminders=1 AND s.scope='uman' AND s.day IN (?,?)
+  `).bind(day, tomorrow).all();
+  let sent = 0;
+  for (const subscriber of results) {
+    const relativeMinute = minute - (subscriber.day === tomorrow ? 1440 : 0);
+    for (const start of upcomingOutages(subscriber.hours, relativeMinute)) {
+      if (sent >= 10) return;
+      const claim = await env.DB.prepare(
+        "INSERT OR IGNORE INTO reminder_sent(chat_id,day,queue,start) VALUES(?,?,?,?) RETURNING chat_id"
+      ).bind(subscriber.chat_id, subscriber.day, subscriber.queue, start).first();
+      if (!claim) continue;
+      sent++;
+      try {
+        const remaining = Number(start.slice(0, 2))*60 + Number(start.slice(3)) - relativeMinute;
+        const result = await send(env, subscriber.chat_id, "⏰ Умань · підчерга " + subscriber.queue +
+          "\nЗа " + remaining + " хв, о " + start + ", за графіком почнеться відключення.");
+        if (!result.ok) throw new Error("Reminder rejected");
+      } catch {
+        await env.DB.prepare("DELETE FROM reminder_sent WHERE chat_id=? AND day=? AND queue=? AND start=?")
+          .bind(subscriber.chat_id, subscriber.day, subscriber.queue, start).run();
+      }
+    }
+  }
+}
+
 const buttons = {
+  "⏰ Нагадування за 20 хв": "/reminders",
+  "✅ Увімкнути нагадування": "/reminders on",
+  "❌ Вимкнути нагадування": "/reminders off",
   "📅 Графік на сьогодні": "/today",
   "🔔 Увімкнути сповіщення": "/start",
   "⚙️ Обрати підчергу": "/queue",
@@ -357,6 +406,7 @@ const buttons = {
 const menu = {
   keyboard: [
     ["📅 Графік на сьогодні"],
+    ["⏰ Нагадування за 20 хв"],
     ["⚙️ Обрати підчергу", "❔ Довідка"],
     ["🔔 Увімкнути сповіщення", "🔕 Вимкнути сповіщення"],
   ],
@@ -381,7 +431,7 @@ export default {
       try {
         await deliverNotices(env);
       } finally {
-        await deliver(env);
+        try { await deliver(env); } finally { await deliverReminders(env); }
       }
     }
   },
@@ -430,12 +480,27 @@ export default {
     } else if (command === "/stop") {
       await env.DB.prepare("DELETE FROM subscribers WHERE chat_id = ?").bind(chat).run();
       await send(env, chat, "Підписку вимкнено.", menu);
+    } else if (command === "/reminders") {
+      const subscriber = await env.DB.prepare("SELECT reminders FROM subscribers WHERE chat_id=?").bind(chat).first();
+      if (!subscriber) {
+        await send(env, chat, "Спочатку підключися командою /start.", menu);
+      } else {
+        if (args[0] === "on" || args[0] === "off") {
+          await env.DB.prepare("UPDATE subscribers SET reminders=? WHERE chat_id=?")
+            .bind(Number(args[0] === "on"), chat).run();
+          subscriber.reminders = Number(args[0] === "on");
+        }
+        await send(env, chat, "Нагадування за 20 хв " + (subscriber.reminders ? "увімкнені." : "вимкнені.") +
+          "\nПеревірка кожні 5 хвилин, тому повідомлення може прийти за 15–20 хв до початку.",
+          {...menu, keyboard: [["✅ Увімкнути нагадування"], ["❌ Вимкнути нагадування"], ["↩️ Назад"]]});
+      }
     } else if (command === "/help") {
       await send(env, chat, [
         "Бот повідомляє про уманський графік і важливі оголошення для Уманського району.",
         "🔔 Увімкнути сповіщення (/start) — підписка з підчергою 2.2 за замовчуванням.",
         "📅 Графік на сьогодні (/today) — показати збережені години для твоєї підчерги.",
         "⚙️ Обрати підчергу (/queue) — показати поточну підчергу та вибрати іншу.",
+        "⏰ Нагадування за 20 хв (/reminders) — за замовчуванням вимкнені.",
         "🔕 Вимкнути сповіщення (/stop) — відписатися від розсилки.",
       ].join("\n\n"), menu);
     }
