@@ -252,6 +252,7 @@ async function updateSchedules(env) {
   const db = env.DB;
   const today = kyivDay(new Date());
   const latest = new Map();
+  const sourceWrites = [];
   let requestsLeft = 3;
   const posts = (await readFeed()).sort((a, b) => a.id - b.id);
   await saveNotices(db, posts);
@@ -291,17 +292,20 @@ async function updateSchedules(env) {
     for (const post of parsed) {
       if (post.scope !== "uman" || (post.day && post.day < today)) continue;
       const key = scheduleKey(post);
-      await db.prepare(`
+      sourceWrites.push(db.prepare(`
         INSERT INTO schedule_sources(post_id, scope, day, queue, hours, published, is_update)
         VALUES (?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(post_id, scope, day, queue) DO UPDATE SET hours=excluded.hours,
           published=excluded.published, is_update=excluded.is_update
       `).bind(post.id, post.scope, post.day, post.queue, post.hours, raw.datetime,
-        Number(/оновлен|коригув/iu.test(raw.text.slice(0, raw.text.indexOf("Години відсутності"))))).run();
+        Number(/оновлен|коригув/iu.test(raw.text.slice(0, raw.text.indexOf("Години відсутності"))))));
       latest.set(key, post);
     }
   }
   if (!latest.size) return;
+  for (let offset = 0; offset < sourceWrites.length; offset += 50) {
+    await db.batch(sourceWrites.slice(offset, offset + 50));
+  }
   for (const post of latest.values()) {
     const {results} = await db.prepare("SELECT * FROM schedule_sources WHERE scope=? AND day=? AND queue=? ORDER BY post_id")
       .bind(post.scope, post.day, post.queue).all();
@@ -425,17 +429,38 @@ const queuePicker = {
 
 export default {
   async scheduled(_event, env) {
-    try {
-      await updateSchedules(env);
-    } finally {
+    const stages = [
+      ["updateSchedules", updateSchedules],
+      ["deliverNotices", deliverNotices],
+      ["deliver", deliver],
+      ["deliverReminders", deliverReminders],
+    ];
+    let failed = false;
+    for (const [name, run] of stages) {
       try {
-        await deliverNotices(env);
-      } finally {
-        try { await deliver(env); } finally { await deliverReminders(env); }
+        await run(env);
+        console.log("stage completed", name);
+      } catch (error) {
+        failed = true;
+        console.error("stage failed", name, String(error?.message ?? error).replace(/bot[0-9]+:[A-Za-z0-9_-]+/g, "bot[redacted]"));
       }
     }
+    if (failed) throw new Error("Scheduled bot stages failed; see stage logs");
   },
   async fetch(request, env) {
+    if (new URL(request.url).pathname === "/health" && request.method === "GET") {
+      try {
+        await env.DB.prepare("SELECT reminders FROM subscribers LIMIT 1").all();
+        await env.DB.prepare("SELECT day_complete FROM schedules LIMIT 1").all();
+        await env.DB.prepare("SELECT post_id FROM schedule_sources LIMIT 1").all();
+        await env.DB.prepare("SELECT start FROM reminder_sent LIMIT 1").all();
+        const configured = Boolean(env.BOT_TOKEN && env.WEBHOOK_SECRET);
+        return Response.json({ok: configured, database: "ready", secrets: configured ? "ready" : "missing"},
+          {status: configured ? 200 : 503});
+      } catch {
+        return Response.json({ok: false, database: "check binding DB and migrations through 0005"}, {status: 503});
+      }
+    }
     if (new URL(request.url).pathname !== "/telegram" || request.method !== "POST") {
       return new Response("Not found", {status: 404});
     }
